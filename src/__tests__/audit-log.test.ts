@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi, beforeEach } from "vitest";
+import { scValToNative } from "@stellar/stellar-sdk";
 import {
   parseAuditTimestamp,
   auditLogQuerySchema,
@@ -10,8 +11,19 @@ import {
   escapeCsvField,
   auditEntryToCsvRow,
   buildAuditExportFilename,
+  readAuditLogTotalCount,
+  readAuditEntryById,
+  iterateAuditLogEntries,
   type AuditLogEntry,
 } from "@/lib/audit-log";
+
+const mockSimulateContractCall = vi.fn();
+
+vi.mock("@/lib/contracts", () => ({
+  simulateContractCall: (...args: unknown[]) => mockSimulateContractCall(...args),
+  DEFAULT_CONTRACT_ID: "CAQQYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY",
+  CHAIN_READ_SOURCE: "GACZ7ZELCUC5YGJ6JHIVLEZNR3XKYKOVUWD6H3IRFPRZMALNUYJZQM2U",
+}));
 
 const entry = (overrides: Partial<AuditLogEntry> = {}): AuditLogEntry => ({
   id: 3,
@@ -37,7 +49,7 @@ describe("parseAuditTimestamp", () => {
     expect(parseAuditTimestamp("  1785168000  ")).toBe(1785168000);
   });
 
-  it("returns null for unparseable input", () => {
+  it("returns null for unparsable input", () => {
     expect(parseAuditTimestamp("not-a-date")).toBeNull();
     expect(parseAuditTimestamp("999999999999999999999")).toBeNull();
   });
@@ -199,5 +211,163 @@ describe("buildAuditExportFilename", () => {
     expect(buildAuditExportFilename(now)).toBe(
       "ophirpay-audit-log-2026-08-26.csv"
     );
+  });
+});
+
+describe("readAuditLogTotalCount", () => {
+  beforeEach(() => {
+    mockSimulateContractCall.mockReset();
+  });
+
+  it("returns the on-chain count when valid and positive", async () => {
+    mockSimulateContractCall.mockResolvedValueOnce({
+      status: "OK",
+      returnValue: 7,
+    });
+    expect(await readAuditLogTotalCount()).toBe(7);
+  });
+
+  it("returns 0 when the contract call throws", async () => {
+    mockSimulateContractCall.mockRejectedValueOnce(new Error("rpc down"));
+    expect(await readAuditLogTotalCount()).toBe(0);
+  });
+
+  it("returns 0 when the result is falsy", async () => {
+    mockSimulateContractCall.mockResolvedValueOnce(undefined);
+    expect(await readAuditLogTotalCount()).toBe(0);
+  });
+
+  it("returns 0 when the simulation failed", async () => {
+    mockSimulateContractCall.mockResolvedValueOnce({
+      status: "SIMULATION_FAILED",
+      returnValue: undefined,
+    });
+    expect(await readAuditLogTotalCount()).toBe(0);
+  });
+
+  it("returns 0 when there is no return value", async () => {
+    mockSimulateContractCall.mockResolvedValueOnce({
+      status: "OK",
+      returnValue: undefined,
+    });
+    expect(await readAuditLogTotalCount()).toBe(0);
+  });
+
+  it("returns 0 for a non-positive count", async () => {
+    mockSimulateContractCall.mockResolvedValueOnce({ status: "OK", returnValue: 0 });
+    expect(await readAuditLogTotalCount()).toBe(0);
+  });
+});
+
+describe("readAuditEntryById", () => {
+  beforeEach(() => {
+    mockSimulateContractCall.mockReset();
+  });
+
+  it("normalizes the on-chain entry on success", async () => {
+    mockSimulateContractCall.mockResolvedValueOnce({
+      status: "OK",
+      returnValue: { ...entry(), id: 9 },
+    });
+    expect(await readAuditEntryById(9)).toEqual(entry({ id: 9 }));
+  });
+
+  it("returns null when the simulation failed", async () => {
+    mockSimulateContractCall.mockResolvedValueOnce({
+      status: "SIMULATION_FAILED",
+      returnValue: undefined,
+    });
+    expect(await readAuditEntryById(9)).toBeNull();
+  });
+
+  it("returns null when there is no return value", async () => {
+    mockSimulateContractCall.mockResolvedValueOnce({
+      status: "OK",
+      returnValue: undefined,
+    });
+    expect(await readAuditEntryById(9)).toBeNull();
+  });
+
+  it("returns null when the contract call throws", async () => {
+    mockSimulateContractCall.mockRejectedValueOnce(new Error("rpc down"));
+    expect(await readAuditEntryById(9)).toBeNull();
+  });
+});
+
+describe("iterateAuditLogEntries", () => {
+  const collect = async (gen: AsyncGenerator<AuditLogEntry>) => {
+    const out: AuditLogEntry[] = [];
+    for await (const e of gen) out.push(e);
+    return out;
+  };
+
+  beforeEach(() => {
+    mockSimulateContractCall.mockReset();
+    mockSimulateContractCall.mockImplementation(
+      async (_contractId: string, method: string, _source: string, args: unknown[]) => {
+        if (method === "get_audit_log_count") return { status: "OK", returnValue: 3 };
+        if (method === "get_audit_entry") {
+          const id = Number(
+            scValToNative(args[0] as Parameters<typeof scValToNative>[0])
+          );
+          return {
+            status: "OK",
+            returnValue: {
+              id,
+              timestamp: 1785168000 + id,
+              action: `action_${id}`,
+              actor: entry().actor,
+              target_id: id,
+              details: `details_${id}`,
+            },
+          };
+        }
+        return { status: "OK", returnValue: undefined };
+      }
+    );
+  });
+
+  it("yields nothing when the ledger is empty", async () => {
+    mockSimulateContractCall.mockImplementation(() =>
+      Promise.resolve({ status: "OK", returnValue: 0 })
+    );
+    const ids = (await collect(iterateAuditLogEntries())).map((e) => e.id);
+    expect(ids).toEqual([]);
+  });
+
+  it("yields newest-first by default (descending order)", async () => {
+    const ids = (await collect(iterateAuditLogEntries({}))).map((e) => e.id);
+    expect(ids).toEqual([3, 2, 1]);
+  });
+
+  it("yields oldest-first for ascending order", async () => {
+    const ids = (await collect(iterateAuditLogEntries({ order: "asc" }))).map(
+      (e) => e.id
+    );
+    expect(ids).toEqual([1, 2, 3]);
+  });
+
+  it("applies the combined filters while iterating", async () => {
+    const filtered = await collect(
+      iterateAuditLogEntries({ action: "action_2", actor: entry().actor })
+    );
+    expect(filtered.map((e) => e.id)).toEqual([2]);
+  });
+
+  it("skips null entries returned from the chain", async () => {
+    mockSimulateContractCall.mockImplementation(
+      async (_id: string, method: string, _s: string, args: unknown[]) => {
+        if (method === "get_audit_log_count") return { status: "OK", returnValue: 2 };
+        const id = Number(
+          scValToNative(args[0] as Parameters<typeof scValToNative>[0])
+        );
+        // Only entry id 1 resolves; id 2 comes back null.
+        return id === 1
+          ? { status: "OK", returnValue: { ...entry(), id: 1 } }
+          : { status: "OK", returnValue: undefined };
+      }
+    );
+    const ids = (await collect(iterateAuditLogEntries())).map((e) => e.id);
+    expect(ids).toEqual([1]);
   });
 });
